@@ -39,14 +39,15 @@ if __name__ == "__main__":
     hs = [0.0]  # initial h
 
     for _ in range(steps):
-        hs.append(round(update_h(hs[-1], A, beta, Tp, Qd), 2))
+        hs.append(update_h(hs[-1], A, beta, Tp, Qd))
 
+    hs_rounded = [round(i, 2) for i in hs]
     os.makedirs("results", exist_ok=True)  # Make dir if not exists
     fig = go.Figure()
     fig.add_trace(
         go.Scatter(
             x=times,
-            y=hs,
+            y=hs_rounded,
             mode="lines",
             name="h(t)",
             line=dict(width=2, color="#1f77b4"),
