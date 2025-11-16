@@ -1,0 +1,6 @@
+dash>=2.0.0
+Dash-Bootstrap-Components>=1.0.0
+plotly>=5.0.0
+numpy>=1.22
+scipy>=1.8
+simpful>=2.12.0
