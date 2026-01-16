@@ -1,722 +1,452 @@
-
-import math
-from functools import lru_cache
+import numpy as np
 
 import dash
 from dash import dcc, html
 import dash_bootstrap_components as dbc
 from dash.dependencies import Input, Output, State
 
-import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from simpful import FuzzySet, FuzzySystem, LinguisticVariable, Triangular_MF
 
-# Optional MF shapes (availability depends on Simpful version)
-try:
-    from simpful import Trapezoidal_MF
-except Exception:
-    Trapezoidal_MF = None
 
-try:
-    from simpful import Gaussian_MF
-except Exception:
-    Gaussian_MF = None
+# ======================================================
+# GLOBAL CONFIG
+# ======================================================
 
-try:
-    from simpful import Sigmoid_MF
-except Exception:
-    Sigmoid_MF = None
+APP_TITLE = "ISS – Tempomat"
+G = 9.81
+U_MIN, U_MAX = -100.0, 100.0
 
-try:
-    from simpful import Bell_MF
-except Exception:
-    Bell_MF = None
+# Cache for fuzzy simulation results
+fuzzy_cache = {
+    "key": None,  # (vehicle, buckets, sp, T, Tp)
+    "t": None,
+    "vf": None,
+    "uf": None,
+}
 
 
-app = dash.Dash(external_stylesheets=[dbc.themes.BOOTSTRAP])
-app.title = "Cruise Control"
-
-g = 9.81  # [m/s^2]
-
-
-# ----------------- Model pojazdu (szybka symulacja) -----------------
-def vehicle_acceleration(v, u_percent, load, air_density, slope_deg, friction):
-    """
-    Model pojazdu: zwraca przyspieszenie a [m/s^2].
-    Szybka integracja: Euler (zamiast odeint).
-    """
-    m_vehicle = 1400.0
-    m = m_vehicle + load
-
-    Cd = 0.24
-    rho = air_density
-    A = 5.0
-    F_c_max = 10000.0
-
-    theta = math.radians(slope_deg)
-
-    F_c = (u_percent / 100.0) * F_c_max
-    F_op = 0.5 * rho * Cd * A * (v ** 2)
-    F_roll = friction * m * g * math.cos(theta)
-    F_grade = m * g * math.sin(theta)
-
-    F_w = F_c - F_op - (F_roll + F_grade)
-    return F_w / m
-
-
-def step_velocity(v, u, dt, load, air_density, slope, friction):
-    a = vehicle_acceleration(v, u, load, air_density, slope, friction)
-    v_next = v + a * dt
-    return max(0.0, float(v_next))
+VEHICLES = {
+    "sportowe": {
+        "label": "Sportowe",
+        "m": 1200.0,
+        "Cd": 0.30,
+        "A": 2.2,
+        "Fmax": 5000.0,
+        "v_max": 100.0,
+        "pid": dict(Kp=0.32, Ti=7.0, Td=0.9, Tp=0.1),
+        "fuzzy_span": 60.0,
+    },
+    "osobowe": {
+        "label": "Osobowe",
+        "m": 1500.0,
+        "Cd": 0.32,
+        "A": 2.4,
+        "Fmax": 4000.0,
+        "v_max": 70.0,
+        "pid": dict(Kp=0.24, Ti=10.0, Td=1.0, Tp=0.2),
+        "fuzzy_span": 45.0,
+    },
+    "ciezarowe": {
+        "label": "Ciężarowe",
+        "m": 20000.0,
+        "Cd": 0.7,
+        "A": 10.0,
+        "Fmax": 15000.0,
+        "v_max": 30.0,
+        "pid": dict(Kp=0.55, Ti=18.0, Td=0.6, Tp=0.5),
+        "fuzzy_span": 25.0,
+    },
+}
 
 
-def _clamp_throttle(value: float) -> float:
-    return float(max(-50.0, min(100.0, value)))
+# ======================================================
+# MODEL POJAZDU
+# ======================================================
+
+def clamp(u):
+    return max(U_MIN, min(U_MAX, u))
 
 
-# ----------------- Linguistic terms -----------------
-def _terms_input(n: int):
-    if n == 3:
-        return ["U", "Z", "D"]
-    if n == 5:
-        return ["DU", "MU", "Z", "MD", "DD"]
-    if n == 7:
-        return ["DU", "ŚU", "MU", "Z", "MD", "ŚD", "DD"]
-    raise ValueError("Dozwolone wartości: 3, 5, 7")
+def step_velocity(v, u, dt, p):
+    rho = 1.2
+    F_trac = (u / 100.0) * p["Fmax"]
+    F_aero = 0.5 * rho * p["Cd"] * p["A"] * v**2
+    a = (F_trac - F_aero) / p["m"]
+    return max(0.0, min(p["v_max"], v + a * dt))
 
 
-# ----------------- Membership functions -----------------
-def _mf_available(mf_type: str) -> bool:
-    mf_type = (mf_type or "").lower()
-    if mf_type == "triangular":
-        return True
-    if mf_type == "trapezoid":
-        return Trapezoidal_MF is not None
-    if mf_type == "gaussian":
-        return Gaussian_MF is not None
-    if mf_type == "sigmoid":
-        return Sigmoid_MF is not None
-    if mf_type == "bell":
-        return Bell_MF is not None
-    return False
+# ======================================================
+# PID
+# ======================================================
+
+def pid_step(e, e_prev, I, cfg):
+    Kp, Ti, Td, Tp = cfg["Kp"], cfg["Ti"], cfg["Td"], cfg["Tp"]
+
+    I_new = I + (Tp / Ti) * e if Ti > 0 else I
+    D = (Td / Tp) * (e - e_prev)
+    u = Kp * (e + I_new + D)
+    u_sat = clamp(u)
+
+    if u != u_sat:
+        I_new = I
+
+    return u_sat, I_new
 
 
-def _build_mf_sets(span: float, terms, mf_type: str):
-    """
-    Buduje zbiory rozmyte równomiernie na [-span, span].
-    Jeśli MF nie jest dostępna w Twojej wersji simpful -> fallback do trójkątnej.
-    """
-    mf_req = (mf_type or "triangular").lower()
-    mf_used = mf_req if _mf_available(mf_req) else "triangular"
+# ======================================================
+# FUZZY MAMDANI (SIMPFUL - 2 INPUTS)
+# ======================================================
 
+def fuzzy_controller(buckets, span):
+
+    TERMS = {
+        3: ["N", "Z", "P"],
+        5: ["NB", "NS", "Z", "PS", "PB"],
+        7: ["NB", "NM", "NS", "Z", "PS", "PM", "PB"],
+    }
+
+    terms = TERMS[buckets]
     n = len(terms)
-    centers = np.linspace(-span, span, n).tolist()
-    step = centers[1] - centers[0] if n > 1 else span
+    mid = n // 2
 
-    sets = []
-    for i, term in enumerate(terms):
-        c = centers[i]
+    # ============================
+    # Agresywność zależna od liczby zbiorów
+    # ============================
+    SPAN_SCALE = {3: 0.45, 5: 0.75, 7: 1.00}[buckets]
+    OUT_GAIN   = {3: 2.30, 5: 1.40, 7: 1.00}[buckets]
+    CE_DAMP    = {3: 0.20, 5: 0.50, 7: 0.75}[buckets]
 
-        if mf_used == "triangular":
+    span_e = span * SPAN_SCALE
+    ce_span = span_e * 0.8
+
+    fs = FuzzySystem()
+
+    # ============================
+    # Zbiory trójkątne
+    # ============================
+    def tri_sets(s):
+        centers = np.linspace(-s, s, n)
+        out = []
+        for i, term in enumerate(terms):
             if i == 0:
-                a, b, d = -span, -span, centers[i + 1]
+                a, b, c = -s, -s, centers[i + 1]
             elif i == n - 1:
-                a, b, d = centers[i - 1], span, span
+                a, b, c = centers[i - 1], s, s
             else:
-                a, b, d = centers[i - 1], c, centers[i + 1]
-            mf = Triangular_MF(a, b, d)
+                a, b, c = centers[i - 1], centers[i], centers[i + 1]
+            out.append(FuzzySet(function=Triangular_MF(a, b, c), term=term)
+)
+        return out
 
-        elif mf_used == "trapezoid":
-            # a----b====c----d
-            w = abs(step)
-            a = c - 1.0 * w
-            b = c - 0.4 * w
-            cc = c + 0.4 * w
-            d = c + 1.0 * w
-            a, b, cc, d = max(-span, a), max(-span, b), min(span, cc), min(span, d)
-            mf = Trapezoidal_MF(a, b, cc, d)
+    # ============================
+    # Wejścia
+    # ============================
+    fs.add_linguistic_variable(
+        "e",
+        LinguisticVariable(tri_sets(span_e), universe_of_discourse=[-span_e, span_e]),
+    )
 
-        elif mf_used == "gaussian":
-            sigma = max(1e-6, abs(step) / 2.0)
-            mf = Gaussian_MF(c, sigma)
+    fs.add_linguistic_variable(
+        "ce",
+        LinguisticVariable(tri_sets(ce_span), universe_of_discourse=[-ce_span, ce_span]),
+    )
 
-        elif mf_used == "sigmoid":
-            a = 5.0 / max(1e-6, abs(step))
-            if i <= (n // 2):
-                mf = Sigmoid_MF(-a, c)
+    fs.add_linguistic_variable(
+        "u",
+        LinguisticVariable(tri_sets(100.0), universe_of_discourse=[-100.0, 100.0]),
+    )
+
+    # ============================
+    # Reguły
+    # ============================
+    rules = []
+    for i, te in enumerate(terms):
+        for j, tce in enumerate(terms):
+
+            base_idx = i
+
+            if buckets == 3 and j == mid:
+                adjustment = 1 if i >= mid else 0
+            elif j == mid:
+                adjustment = 1 if i > mid else 0
             else:
-                mf = Sigmoid_MF(a, c)
+                adjustment = (j - mid) // 2
 
-        elif mf_used == "bell":
-            a = max(1e-6, abs(step))
-            b = 2.0
-            mf = Bell_MF(c, a, b)
+            idx = max(0, min(n - 1, base_idx + adjustment))
 
-        sets.append(FuzzySet(function=mf, term=term))
+            rules.append(
+                f"IF (e IS {te}) AND (ce IS {tce}) THEN (u IS {terms[idx]})"
+            )
 
-    return sets, mf_used
-
-
-# ----------------- AND operator (T-norma) -----------------
-def _safe_make_fuzzysystem(and_tnorm: str):
-    if (and_tnorm or "min").lower() != "product":
-        return FuzzySystem()
-    try:
-        return FuzzySystem(operators=["AND_PRODUCT"])
-    except Exception:
-        return FuzzySystem()
-
-
-# ----------------- Rule base -----------------
-def _build_rules_pid_3d(terms):
-    """
-    Prosty fuzzy-PID:
-      IF e is ... AND ce is ... AND se is ... THEN u is ...
-    Mapowanie poziomów: u_level ≈ e_level + ce_level + se_level (symetrycznie).
-    """
-    n = len(terms)
-    mid = n // 2
-    rules = []
-    for i_e, te in enumerate(terms):
-        e_level = i_e - mid
-        for i_ce, tce in enumerate(terms):
-            ce_level = i_ce - mid
-            for i_se, tse in enumerate(terms):
-                se_level = i_se - mid
-                out_level = e_level + ce_level + se_level
-                out_idx = max(0, min(n - 1, out_level + mid))
-                rules.append(
-                    f"IF (e IS {te}) AND (ce IS {tce}) AND (se IS {tse}) THEN (u IS {terms[out_idx]})"
-                )
-    return rules
-
-
-# ----------------- Cached controllers -----------------
-@lru_cache(maxsize=96)
-def _cached_mamdani_controller(buckets: int, mf_type: str, and_tnorm: str, wyostrzanie: str, setpoint_int: int):
-    """
-    Mamdani + WYOSTRZANIE (defuzyfikacja).
-    Mapa metod (nazwy jak w simpful):
-      - centroid  -> środek ciężkości
-      - mom       -> środek maksimum
-      - som       -> pierwsze maksimum
-      - lom       -> ostatnie maksimum
-    """
-    terms = _terms_input(buckets)
-
-    sp = float(max(0.0, setpoint_int))
-    e_span = max(20.0, 2.0 * sp)
-    u_span = 100.0
-
-    fs = _safe_make_fuzzysystem(and_tnorm)
-
-    e_sets, mf_used = _build_mf_sets(e_span, terms, mf_type)
-    ce_sets, _ = _build_mf_sets(e_span, terms, mf_type)
-    se_sets, _ = _build_mf_sets(e_span, terms, mf_type)
-    u_sets, _ = _build_mf_sets(u_span, terms, mf_type)
-
-    fs.add_linguistic_variable("e", LinguisticVariable(e_sets, universe_of_discourse=[-e_span, e_span]))
-    fs.add_linguistic_variable("ce", LinguisticVariable(ce_sets, universe_of_discourse=[-e_span, e_span]))
-    fs.add_linguistic_variable("se", LinguisticVariable(se_sets, universe_of_discourse=[-e_span, e_span]))
-    fs.add_linguistic_variable("u", LinguisticVariable(u_sets, universe_of_discourse=[-u_span, u_span]))
-
-    fs.add_rules(_build_rules_pid_3d(terms))
-
-    method = (wyostrzanie or "centroid").lower().strip()
-    if method not in {"centroid", "mom", "som", "lom"}:
-        method = "centroid"
-    try:
-        fs.set_defuzzification(method)
-    except Exception:
-        # jeśli dana wersja nie wspiera -> centroid
-        try:
-            fs.set_defuzzification("centroid")
-        except Exception:
-            pass
-
-    def compute_u(e, ce, se):
-        fs.set_variable("e", max(-e_span, min(e_span, float(e))))
-        fs.set_variable("ce", max(-e_span, min(e_span, float(ce))))
-        fs.set_variable("se", max(-e_span, min(e_span, float(se))))
-        out = fs.inference()["u"]
-        return _clamp_throttle(out)
-
-    return compute_u, mf_used
-
-
-@lru_cache(maxsize=96)
-def _cached_tsk_controller(
-    buckets: int,
-    mf_type: str,
-    and_tnorm: str,
-    setpoint_int: int,
-    order: str,
-    a: float,
-    b: float,
-    c: float,
-    d: float,
-):
-    terms = _terms_input(buckets)
-
-    sp = float(max(0.0, setpoint_int))
-    e_span = max(20.0, 2.0 * sp)
-
-    fs = _safe_make_fuzzysystem(and_tnorm)
-
-    e_sets, mf_used = _build_mf_sets(e_span, terms, mf_type)
-    ce_sets, _ = _build_mf_sets(e_span, terms, mf_type)
-    se_sets, _ = _build_mf_sets(e_span, terms, mf_type)
-
-    fs.add_linguistic_variable("e", LinguisticVariable(e_sets, universe_of_discourse=[-e_span, e_span]))
-    fs.add_linguistic_variable("ce", LinguisticVariable(ce_sets, universe_of_discourse=[-e_span, e_span]))
-    fs.add_linguistic_variable("se", LinguisticVariable(se_sets, universe_of_discourse=[-e_span, e_span]))
-
-    n = len(terms)
-    centers = np.linspace(-100.0, 100.0, n).tolist()
-    order = (order or "liniowy").lower()
-
-    out_fn_for_term = {}
-    for term, k in zip(terms, centers):
-        fn = f"OUT_{term}"
-        out_fn_for_term[term] = fn
-        if order.startswith("sta"):
-            fs.set_output_function(fn, f"{float(k)}")
-        else:
-            expr = f"{float(a)}*e + {float(b)}*ce + {float(c)}*se + {float(d)} + {float(k)}"
-            fs.set_output_function(fn, expr)
-
-    mid = n // 2
-    rules = []
-    for i_e, te in enumerate(terms):
-        e_level = i_e - mid
-        for i_ce, tce in enumerate(terms):
-            ce_level = i_ce - mid
-            for i_se, tse in enumerate(terms):
-                se_level = i_se - mid
-                out_level = e_level + ce_level + se_level
-                out_idx = max(0, min(n - 1, out_level + mid))
-                tout = terms[out_idx]
-                rules.append(
-                    f"IF (e IS {te}) AND (ce IS {tce}) AND (se IS {tse}) THEN (u IS {out_fn_for_term[tout]})"
-                )
     fs.add_rules(rules)
 
-    def compute_u(e, ce, se):
-        fs.set_variable("e", max(-e_span, min(e_span, float(e))))
-        fs.set_variable("ce", max(-e_span, min(e_span, float(ce))))
-        fs.set_variable("se", max(-e_span, min(e_span, float(se))))
-        out = fs.Sugeno_inference(["u"])["u"]
-        return _clamp_throttle(out)
+    # ============================
+    # Pseudo-integrator (fuzzy-PI)
+    # ============================
+    ie = 0.0
+    IE_MAX = span * 8.0
+    KI = 0.35
+    LEAK = 0.002
 
-    return compute_u, mf_used
+    # ============================
+    # Funkcja sterująca
+    # ============================
+    def compute(e, ce, _se):
+        nonlocal ie
+
+        e = max(-span_e, min(span_e, e))
+        ce = max(-ce_span, min(ce_span, ce))
+
+        fs.set_variable("e", e)
+        fs.set_variable("ce", ce)
+
+        u0 = fs.inference()["u"]
+
+        # całkowanie błędu (leaky integrator)
+        ie = (1.0 - LEAK) * ie + e
+        ie = max(-IE_MAX, min(IE_MAX, ie))
+
+        u = (
+            OUT_GAIN * u0
+            + KI * (ie / IE_MAX) * 100.0
+            - CE_DAMP * (ce / ce_span) * 40.0
+        )
+
+        return clamp(u)
+
+    return compute
 
 
-def _make_error_figure(message: str):
-    fig = go.Figure()
-    fig.add_annotation(
-        text=message,
-        x=0.5,
-        y=0.5,
-        xref="paper",
-        yref="paper",
-        showarrow=False,
-        font=dict(size=16),
-    )
-    fig.update_layout(
-        plot_bgcolor="white",
-        paper_bgcolor="white",
-        margin=dict(l=40, r=20, t=40, b=40),
-    )
-    return fig
 
+# ======================================================
+# DASH APP
+# ======================================================
 
-# ----------------- UI -----------------
-app.layout = html.Div(
-    style={
-        "backgroundColor": "#F3F4F6",
-        "height": "100vh",
-        "overflow": "hidden",
-        "display": "flex",
-        "flexDirection": "column",
-    },
-    children=[
-        html.Div(
-            html.H1("Cruise Control", style={"textAlign": "center", "color": "white", "margin": 0, "fontWeight": "bold"}),
-            style={"backgroundColor": "#1D4ED8", "padding": "14px 0", "boxShadow": "0 2px 4px rgba(0,0,0,0.1)", "flexShrink": 0},
-        ),
-        dbc.Container(
-            fluid=True,
-            style={"flex": 1, "overflow": "hidden", "paddingTop": "10px", "paddingBottom": "10px"},
-            children=[
-                dbc.Row(
-                    style={"height": "100%"},
-                    children=[
-                        dbc.Col(
-                            width=3,
-                            style={"height": "100%"},
-                            children=[
-                                dbc.Card(
-                                    style={
-                                        "backgroundColor": "white",
-                                        "border": "1px solid #BFDBFE",
-                                        "boxShadow": "0 2px 6px rgba(148,163,184,0.35)",
-                                        "borderRadius": "14px",
-                                        "padding": "14px",
-                                        "height": "100%",
-                                        "overflowY": "auto",
-                                    },
-                                    children=[
-                                        html.H5("Parametry symulacji", style={"color": "#1D4ED8", "marginBottom": "10px", "fontWeight": "bold"}),
-                                        html.Label("Prędkość zadana [m/s]", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="setPoint", min=0, max=100, step=1, value=50, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                        html.Br(),
-                                        html.Label("Czas symulacji [s]", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="t", min=10, max=600, step=10, value=450, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                        html.Br(),
-                                        html.Label("Krok symulacji dt [s]", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="dt", min=0.2, max=2.0, step=0.1, value=1.0, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                        html.Br(),
-                                        html.Label("Obciążenie [kg]", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="load", min=100, max=2000, step=50, value=200, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                        html.Br(),
-                                        html.Label("Gęstość powietrza [kg/m³]", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="airDensity", min=1.0, max=2.0, step=0.01, value=1.2, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                        html.Br(),
-                                        html.Label("Nachylenie drogi [°]", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="slope", min=0, max=30, step=1, value=0, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                        html.Br(),
-                                        html.Label("Współczynnik tarcia [-]", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="friction", min=0.0, max=0.5, step=0.01, value=0.1, marks=None, tooltip={"always_visible": True, "placement": "top"}),
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP])
+app.title = APP_TITLE
 
-                                        html.Hr(),
-                                        html.H5("Regulator PID", style={"color": "#1D4ED8", "marginBottom": "8px", "fontWeight": "bold"}),
-                                        html.Label("Kp", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="kp", min=0, max=1, step=0.001, value=0.03, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                        html.Br(),
-                                        html.Label("Ki", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="ki", min=0, max=2, step=0.001, value=0.10, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                        html.Br(),
-                                        html.Label("Kd", style={"fontWeight": "500"}),
-                                        dcc.Slider(id="kd", min=0, max=2, step=0.001, value=0.40, marks=None, tooltip={"always_visible": True, "placement": "top"}),
+app.layout = dbc.Container(fluid=True, children=[
 
-                                        html.Hr(),
-                                        html.H5("Regulator rozmyty", style={"color": "#1D4ED8", "marginBottom": "8px", "fontWeight": "bold"}),
+    dcc.Store(id="vehicle", data="osobowe"),
+    dcc.Store(id="fuzzy-buckets", data=5),
 
-                                        dbc.Label("Model"),
-                                        dcc.Dropdown(
-                                            id="fuzzy_model",
-                                            options=[
-                                                {"label": "Mamdani (PID rozmyty)", "value": "mamdani"},
-                                                {"label": "TSK (Takagi–Sugeno–Kang)", "value": "tsk"},
-                                            ],
-                                            value="mamdani",
-                                            clearable=False,
-                                            style={"marginBottom": "10px"},
-                                        ),
+    dbc.Row([
+        dbc.Col(
+            html.H3(APP_TITLE, className="text-white text-center"),
+            style={"background": "#2563eb", "padding": "10px"}
+        )
+    ]),
 
-                                        dbc.Label("Liczba zbiorów lingwistycznych"),
-                                        dcc.Dropdown(
-                                            id="buckets",
-                                            options=[{"label": "3", "value": 3}, {"label": "5", "value": 5}, {"label": "7", "value": 7}],
-                                            value=5,
-                                            clearable=False,
-                                            style={"marginBottom": "10px"},
-                                        ),
+    dbc.Row([
 
-                                        dbc.Label("Typ funkcji przynależności"),
-                                        dcc.Dropdown(
-                                            id="mf_type",
-                                            options=[
-                                                {"label": "Trójkątna", "value": "triangular"},
-                                                {"label": "Trapezowa", "value": "trapezoid"},
-                                                {"label": "Gaussowska", "value": "gaussian"},
-                                                {"label": "Sigmoidalna", "value": "sigmoid"},
-                                                {"label": "Dzwonowa", "value": "bell"},
-                                            ],
-                                            value="triangular",
-                                            clearable=False,
-                                            style={"marginBottom": "10px"},
-                                        ),
+        dbc.Col(width=3, children=[
+            dbc.Card(style={"padding": "12px", "marginTop": "20px"}, children=[
 
-                                        dbc.Label("T-norma (AND)"),
-                                        dcc.Dropdown(
-                                            id="and_tnorm",
-                                            options=[{"label": "MIN", "value": "min"}, {"label": "PROD", "value": "product"}],
-                                            value="min",
-                                            clearable=False,
-                                            style={"marginBottom": "10px"},
-                                        ),
-
-                                        # Mamdani-only: WYOSTRZANIE
-                                        dbc.Collapse(
-                                            id="panel_mamdani",
-                                            is_open=True,
-                                            children=[
-                                                dbc.Label("Wyostrzanie (metoda wyznaczenia wartości liczbowej)"),
-                                                dcc.Dropdown(
-                                                    id="wyostrzanie",
-                                                    options=[
-                                                        {"label": "Środek ciężkości", "value": "centroid"},
-                                                        {"label": "Środek maksimum", "value": "mom"},
-                                                        {"label": "Pierwsze maksimum", "value": "som"},
-                                                        {"label": "Ostatnie maksimum", "value": "lom"},
-                                                    ],
-                                                    value="centroid",
-                                                    clearable=False,
-                                                    style={"marginBottom": "10px"},
-                                                ),
-                                            ],
-                                        ),
-
-                                        # TSK-only
-                                        dbc.Collapse(
-                                            id="panel_tsk",
-                                            is_open=False,
-                                            children=[
-                                                dbc.Label("Postać konkluzji y = f(x)"),
-                                                dcc.Dropdown(
-                                                    id="tsk_order",
-                                                    options=[{"label": "Stała (0 rząd)", "value": "staly"}, {"label": "Liniowa (1 rząd)", "value": "liniowy"}],
-                                                    value="liniowy",
-                                                    clearable=False,
-                                                    style={"marginBottom": "10px"},
-                                                ),
-                                                dbc.Label("a (przy e)"),
-                                                dcc.Slider(id="tsk_a", min=-2.0, max=2.0, step=0.05, value=0.20, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                                html.Br(),
-                                                dbc.Label("b (przy ce)"),
-                                                dcc.Slider(id="tsk_b", min=-2.0, max=2.0, step=0.05, value=0.10, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                                html.Br(),
-                                                dbc.Label("c (przy se)"),
-                                                dcc.Slider(id="tsk_c", min=-2.0, max=2.0, step=0.05, value=0.02, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                                html.Br(),
-                                                dbc.Label("d (wyraz wolny)"),
-                                                dcc.Slider(id="tsk_d", min=-20.0, max=20.0, step=0.5, value=0.0, marks=None, tooltip={"always_visible": True, "placement": "top"}),
-                                                html.Br(),
-                                            ],
-                                        ),
-
-                                        dbc.Alert(id="warning", color="warning", is_open=False, style={"marginTop": "10px"}),
-
-                                        dbc.Button("Uruchom", id="run", n_clicks=0, color="primary", style={"width": "100%", "borderRadius": "10px", "marginTop": "6px"}),
-                                    ],
-                                )
-                            ],
-                        ),
-                        dbc.Col(
-                            width=9,
-                            style={"height": "100%"},
-                            children=[
-                                dbc.Card(
-                                    style={
-                                        "backgroundColor": "white",
-                                        "border": "1px solid #BFDBFE",
-                                        "boxShadow": "0 2px 6px rgba(148,163,184,0.35)",
-                                        "borderRadius": "14px",
-                                        "padding": "8px 10px",
-                                        "height": "100%",
-                                    },
-                                    children=[dcc.Loading(type="circle", children=dcc.Graph(id="graph", style={"height": "100%", "width": "100%"}))],
-                                )
-                            ],
-                        ),
+                html.B("Wybór pojazdu"),
+                dbc.ButtonGroup(
+                    [
+                        dbc.Button("Sportowe", id="veh-sportowe", outline=True, color="primary"),
+                        dbc.Button("Osobowe", id="veh-osobowe", outline=True, color="primary"),
+                        dbc.Button("Ciężarowe", id="veh-ciezarowe", outline=True, color="primary"),
                     ],
-                )
-            ],
-        ),
-    ],
+                    className="mb-2 w-100"
+                ),
+
+                html.Label("Prędkość docelowa [m/s]"),
+                dcc.Slider(id="sp", min=5, max=100, step=1, value=30,
+                           marks=None,
+                           tooltip={"always_visible": True, "placement": "top"}),
+
+                html.Label("Czas symulacji [s]"),
+                dcc.Slider(id="T", min=60, max=600, step=30, value=300,
+                           marks=None,
+                           tooltip={"always_visible": True, "placement": "top"}),
+
+                html.Hr(),
+
+                html.B("Regulator PID"),
+
+                html.Label("Kp – wzmocnienie regulatora [-]"),
+                dcc.Slider(id="kp", min=0.01, max=0.5, step=0.01,
+                           marks=None,
+                           tooltip={"always_visible": True, "placement": "top"}),
+
+                html.Label("Ti – czas zdwojenia [s]"),
+                dcc.Slider(id="ti", min=1, max=60, step=1,
+                           marks=None,
+                           tooltip={"always_visible": True, "placement": "top"}),
+
+                html.Label("Td – czas wyprzedzenia [s]"),
+                dcc.Slider(id="td", min=0.0, max=10.0, step=0.1,
+                           marks=None,
+                           tooltip={"always_visible": True, "placement": "top"}),
+
+                html.Label("Tp – okres próbkowania [s]"),
+                dcc.Slider(id="tp", min=0.1, max=1.0, step=0.1,
+                           marks=None,
+                           tooltip={"always_visible": True, "placement": "top"}),
+
+                html.Hr(),
+
+                html.B("Liczba zbiorów rozmytych"),
+                dbc.ButtonGroup(
+                    [
+                        dbc.Button("3", id="fz-3", outline=True, color="primary"),
+                        dbc.Button("5", id="fz-5", outline=True, color="primary"),
+                        dbc.Button("7", id="fz-7", outline=True, color="primary"),
+                    ],
+                    className="w-100"
+                ),
+
+            ])
+        ]),
+
+        dbc.Col(width=9, children=[
+            dbc.Button("Uruchom symulację", id="run",
+                       color="primary", className="w-100 mb-2", style={"marginTop": "20px"}),
+            dcc.Graph(id="graph", style={"height": "600px"})
+        ])
+    ])
+])
+
+
+# ======================================================
+# CALLBACKS
+# ======================================================
+
+@app.callback(
+    Output("vehicle", "data"),
+    Output("veh-sportowe", "active"),
+    Output("veh-osobowe", "active"),
+    Output("veh-ciezarowe", "active"),
+    Input("veh-sportowe", "n_clicks"),
+    Input("veh-osobowe", "n_clicks"),
+    Input("veh-ciezarowe", "n_clicks"),
+    prevent_initial_call=True,
 )
+def select_vehicle(a, b, c):
+    ctx = dash.callback_context
+    selected = ctx.triggered[0]["prop_id"].split("-")[1].split(".")[0]
+    return selected, selected == "sportowe", selected == "osobowe", selected == "ciezarowe"
 
 
 @app.callback(
-    Output("panel_mamdani", "is_open"),
-    Output("panel_tsk", "is_open"),
-    Input("fuzzy_model", "value"),
+    Output("fuzzy-buckets", "data"),
+    Output("fz-3", "active"),
+    Output("fz-5", "active"),
+    Output("fz-7", "active"),
+    Input("fz-3", "n_clicks"),
+    Input("fz-5", "n_clicks"),
+    Input("fz-7", "n_clicks"),
+    prevent_initial_call=True,
 )
-def toggle_panels(model):
-    model = (model or "mamdani").lower()
-    if model == "tsk":
-        return False, True
-    return True, False
+def select_fuzzy(a, b, c):
+    ctx = dash.callback_context
+    selected = int(ctx.triggered[0]["prop_id"].split("-")[1].split(".")[0])
+    return selected, selected == 3, selected == 5, selected == 7
+
+
+@app.callback(
+    Output("kp", "value"),
+    Output("ti", "value"),
+    Output("td", "value"),
+    Output("tp", "value"),
+    Output("sp", "max"),
+    Input("vehicle", "data"),
+)
+def update_pid(v):
+    p = VEHICLES[v]
+    pid = p["pid"]
+    return pid["Kp"], pid["Ti"], pid["Td"], pid["Tp"], p["v_max"]
 
 
 @app.callback(
     Output("graph", "figure"),
-    Output("warning", "is_open"),
-    Output("warning", "children"),
     Input("run", "n_clicks"),
+    State("vehicle", "data"),
+    State("fuzzy-buckets", "data"),
+    State("sp", "value"),
+    State("T", "value"),
     State("kp", "value"),
-    State("ki", "value"),
-    State("kd", "value"),
-    State("t", "value"),
-    State("dt", "value"),
-    State("load", "value"),
-    State("setPoint", "value"),
-    State("airDensity", "value"),
-    State("slope", "value"),
-    State("friction", "value"),
-    State("fuzzy_model", "value"),
-    State("buckets", "value"),
-    State("mf_type", "value"),
-    State("and_tnorm", "value"),
-    State("wyostrzanie", "value"),
-    State("tsk_order", "value"),
-    State("tsk_a", "value"),
-    State("tsk_b", "value"),
-    State("tsk_c", "value"),
-    State("tsk_d", "value"),
+    State("ti", "value"),
+    State("td", "value"),
+    State("tp", "value"),
 )
-def run_sim(
-    n_clicks,
-    kp, ki, kd,
-    simulation_time,
-    dt,
-    load_,
-    setPoint,
-    airDensity,
-    slope,
-    friction,
-    fuzzy_model,
-    buckets,
-    mf_type,
-    and_tnorm,
-    wyostrzanie,
-    tsk_order,
-    tsk_a,
-    tsk_b,
-    tsk_c,
-    tsk_d,
-):
-    try:
-        tf = float(simulation_time or 450)
-        dt = float(dt or 1.0)
-        dt = max(0.05, min(5.0, dt))
-        nsteps = int(tf / dt) + 1
-        ts = np.linspace(0, tf, nsteps)
+def simulate(_, vehicle, buckets, sp, T, kp, ti, td, tp):
+    global fuzzy_cache
 
-        load = float(load_ or 200)
-        sp = float(setPoint or 50)
-        airDens = float(airDensity or 1.2)
-        slope = float(slope or 0)
-        friction = float(friction or 0.1)
+    p = VEHICLES[vehicle]
+    pid_defaults = p["pid"]
+    cfg = dict(
+        Kp=kp if kp is not None else pid_defaults["Kp"],
+        Ti=ti if ti is not None else pid_defaults["Ti"],
+        Td=td if td is not None else pid_defaults["Td"],
+        Tp=tp if tp is not None else pid_defaults["Tp"]
+    )
 
-        # ---------- PID ----------
-        vs = np.zeros(nsteps)
-        gas_pid = np.zeros(nsteps)
-        v = 0.0
-        integral = 0.0
-        prev_error = sp - v
+    t = np.arange(0, T, cfg["Tp"])
 
-        kp = float(kp or 0.03)
-        ki = float(ki or 0.10)
-        kd = float(kd or 0.40)
+    # Check if we need to recalculate fuzzy
+    fuzzy_key = (vehicle, buckets, sp, T, cfg["Tp"])
 
-        for i in range(1, nsteps):
-            error = sp - v
-            integral += error * dt
-            derivative = (error - prev_error) / dt
+    if fuzzy_cache["key"] == fuzzy_key:
+        # Reuse cached fuzzy results
+        vf = fuzzy_cache["vf"]
+        uf = fuzzy_cache["uf"]
+    else:
+        # Calculate fuzzy simulation
+        fz = fuzzy_controller(buckets, p["fuzzy_span"])
+        v_fz = 0.0
+        ef_prev = 0.0
+        vf, uf = [], []
 
-            u = kp * error + ki * integral + kd * derivative
+        for _ in t:
+            ef = sp - v_fz
+            ufz = fz(ef, (ef - ef_prev) / cfg["Tp"], 0)
+            v_fz = step_velocity(v_fz, ufz, cfg["Tp"], p)
+            vf.append(v_fz)
+            uf.append(ufz)
+            ef_prev = ef
 
-            # clamp + anti-windup
-            if u > 100:
-                u = 100
-                integral -= error * dt
-            if u < -50:
-                u = -50
-                integral -= error * dt
+        # Cache the results
+        fuzzy_cache["key"] = fuzzy_key
+        fuzzy_cache["t"] = t
+        fuzzy_cache["vf"] = vf
+        fuzzy_cache["uf"] = uf
 
-            gas_pid[i] = u
-            prev_error = error
-            v = step_velocity(v, u, dt, load, airDens, slope, friction)
-            vs[i] = v
+    # Always calculate PID simulation (fast)
+    v_pid = 0.0
+    I = 0.0
+    e_prev = 0.0
+    vp, up = [], []
 
-        # ---------- FUZZY ----------
-        warn_open = False
-        warn_msg = ""
+    for _ in t:
+        e = sp - v_pid
+        u, I = pid_step(e, e_prev, I, cfg)
+        v_pid = step_velocity(v_pid, u, cfg["Tp"], p)
+        vp.append(v_pid)
+        up.append(u)
+        e_prev = e
 
-        mf_req = (mf_type or "triangular").lower()
-        if not _mf_available(mf_req):
-            warn_open = True
-            warn_msg = f"Wybrany typ MF („{mf_req}”) nie jest dostępny w tej wersji simpful. Używam trójkątnej."
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
 
-        buckets = int(buckets or 5)
-        fuzzy_model = (fuzzy_model or "mamdani").lower()
-        sp_int = int(round(sp))
+    fig.add_trace(go.Scatter(x=t, y=vp, name="PID"), 1, 1)
+    fig.add_trace(go.Scatter(x=t, y=vf, name="Fuzzy"), 1, 1)
+    fig.add_trace(go.Scatter(x=t, y=[sp]*len(t), name="Zadana", line=dict(dash="dash")), 1, 1)
 
-        if fuzzy_model == "tsk":
-            compute_u, mf_used = _cached_tsk_controller(
-                buckets=buckets,
-                mf_type=mf_req,
-                and_tnorm=and_tnorm,
-                setpoint_int=sp_int,
-                order=tsk_order or "liniowy",
-                a=float(tsk_a or 0.20),
-                b=float(tsk_b or 0.10),
-                c=float(tsk_c or 0.02),
-                d=float(tsk_d or 0.0),
-            )
-        else:
-            compute_u, mf_used = _cached_mamdani_controller(
-                buckets=buckets,
-                mf_type=mf_req,
-                and_tnorm=and_tnorm,
-                wyostrzanie=(wyostrzanie or "centroid"),
-                setpoint_int=sp_int,
-            )
+    fig.add_trace(go.Scatter(x=t, y=up, name="Gaz PID"), 2, 1)
+    fig.add_trace(go.Scatter(x=t, y=uf, name="Gaz Fuzzy"), 2, 1)
 
-        if mf_used != mf_req and not warn_open:
-            warn_open = True
-            warn_msg = "Używam funkcji trójkątnych (fallback)."
+    fig.update_yaxes(title="Prędkość [m/s]", row=1, col=1, range=[0, p["v_max"]+30])
+    fig.update_yaxes(title="Gaz [%]", row=2, col=1, range=[U_MIN, U_MAX])
+    fig.update_xaxes(title="Czas [s]", row=2, col=1)
 
-        f_vs = np.zeros(nsteps)
-        gas_fuzzy = np.zeros(nsteps)
-        fv = 0.0
-        prev_f_error = sp - fv
-        sum_error = 0.0
+    fig.update_layout(height=600, autosize=False)
 
-        for i in range(1, nsteps):
-            e = sp - fv
-            sum_error += e * dt
-            ce = (e - prev_f_error) / dt
-
-            u = compute_u(e, ce, sum_error)
-            gas_fuzzy[i] = u
-            prev_f_error = e
-            fv = step_velocity(fv, u, dt, load, airDens, slope, friction)
-            f_vs[i] = fv
-
-        # ---------- PLOT ----------
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, subplot_titles=("PID controller", "Fuzzy controller"))
-
-        fig.add_trace(go.Scatter(x=ts, y=np.round(vs, 2), name="Prędkość [m/s]", line=dict(color="#1f77b4")), row=1, col=1)
-        fig.add_trace(go.Scatter(x=ts, y=np.round(gas_pid, 2), name="Gaz [%]", line=dict(color="#d62728")), row=1, col=1)
-
-        fig.add_trace(go.Scatter(x=ts, y=np.round(f_vs, 2), name="Prędkość [m/s]", line=dict(color="#1f77b4", dash="dash")), row=2, col=1)
-        fig.add_trace(go.Scatter(x=ts, y=np.round(gas_fuzzy, 2), name="Gaz [%]", line=dict(color="#d62728", dash="dot")), row=2, col=1)
-
-        ymax = max(110.0, sp * 1.4, float(np.max(vs)) * 1.2, float(np.max(f_vs)) * 1.2)
-        ymin = -55.0
-        fig.update_yaxes(range=[ymin, ymax], title_text="v [m/s] oraz gaz [%]", row=1, col=1)
-        fig.update_yaxes(range=[ymin, ymax], title_text="v [m/s] oraz gaz [%]", row=2, col=1)
-        fig.update_xaxes(title_text="t [s]", row=2, col=1)
-
-        fig.update_layout(
-            margin=dict(l=40, r=20, t=60, b=40),
-            legend=dict(x=0.72, y=1.15),
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            font=dict(color="#1F2937"),
-        )
-        fig.update_xaxes(showgrid=True, gridcolor="#E5E7EB", zeroline=False)
-        fig.update_yaxes(showgrid=True, gridcolor="#E5E7EB", zeroline=False)
-
-        return fig, warn_open, warn_msg
-
-    except Exception as e:
-        return _make_error_figure(f"Błąd: {e}"), True, f"Błąd: {e}"
+    return fig
 
 
 if __name__ == "__main__":
