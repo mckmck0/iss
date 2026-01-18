@@ -85,18 +85,27 @@ def step_velocity(v, u, dt, p, slope_deg=0):
 # PID
 # ======================================================
 
-def pid_step(e, e_prev, I, cfg):
+def pid_step(e, e_prev, I, cfg, D_prev):
     Kp, Ti, Td, Tp = cfg["Kp"], cfg["Ti"], cfg["Td"], cfg["Tp"]
 
-    I_new = I + (Tp / Ti) * e if Ti > 0 else I
-    D = (Td / Tp) * (e - e_prev)
-    u = Kp * (e + I_new + D)
+    beta = 0.4
+    alpha = 0.2
+
+    # I
+    I_new = I + (Tp / Ti) * (beta * e) if Ti > 0 else I
+
+    # D (filtered)
+    D_raw = (Td / Tp) * (e - e_prev)
+    D = alpha * D_raw + (1 - alpha) * D_prev
+
+    u = Kp * (beta * e + I_new + D)
     u_sat = clamp(u)
 
     if u != u_sat:
         I_new = I
 
-    return u_sat, I_new
+    return u_sat, I_new, D
+
 
 
 # ======================================================
@@ -199,8 +208,8 @@ def fuzzy_controller(buckets, span):
     def compute(e, ce, _se):
         nonlocal ie
 
-        e = max(-span_e, min(span_e, e))
-        ce = max(-ce_span, min(ce_span, ce))
+        e = np.clip(e, -span_e, span_e)
+        ce = np.clip(ce, -ce_span, ce_span)
 
         fs.set_variable("e", e)
         fs.set_variable("ce", ce)
@@ -409,6 +418,8 @@ def simulate(_, vehicle, sp, T, kp, ti, td, tp, slope):
     )
 
     t = np.arange(0, T, cfg["Tp"])
+    Tp_fuzzy = max(cfg["Tp"], 0.5)  # Fuzzy slower than PID
+    fuzzy_step = int(round(Tp_fuzzy / cfg["Tp"]))
 
     # Check if we need to recalculate fuzzy
     fuzzy_key = (vehicle, buckets, sp, T, cfg["Tp"], slope)
@@ -424,12 +435,19 @@ def simulate(_, vehicle, sp, T, kp, ti, td, tp, slope):
         ef_prev = 0.0
         vf, uf = [], []
 
-        for _ in t:
-            ef = sp - v_fz
-            ufz = fz(ef, (ef - ef_prev) / cfg["Tp"], 0)
-            v_fz = step_velocity(v_fz, ufz, cfg["Tp"], p, slope)
+        u_hold = 0.0  # ostatnie sterowanie fuzzy (ZOH)
+
+        for k, _ in enumerate(t):
+
+            if k % fuzzy_step == 0:
+                ef = sp - v_fz
+                u_hold = fz(ef, (ef - ef_prev) / cfg["Tp"], 0)
+                ef_prev = ef
+
+            v_fz = step_velocity(v_fz, u_hold, cfg["Tp"], p, slope)
+
             vf.append(v_fz)
-            uf.append(ufz)
+            uf.append(u_hold)
             ef_prev = ef
 
         # Cache the results
@@ -444,10 +462,15 @@ def simulate(_, vehicle, sp, T, kp, ti, td, tp, slope):
     e_prev = 0.0
     vp, up = [], []
 
+    F_slope_ff = p["m"] * G * np.sin(np.radians(slope))
+    u_ff = (F_slope_ff / p["Fmax"]) * 100.0
+    D_prev = 0.0
     for _ in t:
         e = sp - v_pid
-        u, I = pid_step(e, e_prev, I, cfg)
+        u_pid, I, D_prev = pid_step(e, e_prev, I, cfg, D_prev)
+        u = clamp(u_ff + u_pid)
         v_pid = step_velocity(v_pid, u, cfg["Tp"], p, slope)
+
         vp.append(v_pid)
         up.append(u)
         e_prev = e
