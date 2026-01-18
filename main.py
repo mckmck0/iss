@@ -17,7 +17,7 @@ from simpful import FuzzySet, FuzzySystem, LinguisticVariable, Triangular_MF
 
 APP_TITLE = "ISS – Tempomat"
 G = 9.81
-U_MIN, U_MAX = -100.0, 100.0
+U_MIN, U_MAX = -20.0, 100.0
 
 # Cache for fuzzy simulation results
 fuzzy_cache = {
@@ -31,32 +31,32 @@ fuzzy_cache = {
 VEHICLES = {
     "sportowe": {
         "label": "Sportowe",
-        "m": 1200.0,
+        "m": 1500.0,
         "Cd": 0.30,
         "A": 2.2,
-        "Fmax": 5000.0,
-        "v_max": 100.0,
+        "Fmax": 16000.0,
+        "v_max": 90.0,
         "pid": dict(Kp=0.32, Ti=7.0, Td=0.9, Tp=0.1),
         "fuzzy_span": 60.0,
     },
     "osobowe": {
         "label": "Osobowe",
-        "m": 1500.0,
+        "m": 1600.0,
         "Cd": 0.32,
         "A": 2.4,
-        "Fmax": 4000.0,
-        "v_max": 70.0,
+        "Fmax": 7000.0,
+        "v_max": 60.0,
         "pid": dict(Kp=0.24, Ti=10.0, Td=1.0, Tp=0.2),
         "fuzzy_span": 45.0,
     },
     "ciezarowe": {
         "label": "Ciężarowe",
-        "m": 20000.0,
+        "m": 40000.0,
         "Cd": 0.7,
         "A": 10.0,
-        "Fmax": 15000.0,
+        "Fmax": 27000.0,
         "v_max": 30.0,
-        "pid": dict(Kp=0.55, Ti=18.0, Td=0.6, Tp=0.5),
+        "pid": dict(Kp=0.40, Ti=12.0, Td=1.5, Tp=0.2),
         "fuzzy_span": 25.0,
     },
 }
@@ -70,11 +70,14 @@ def clamp(u):
     return max(U_MIN, min(U_MAX, u))
 
 
-def step_velocity(v, u, dt, p):
+def step_velocity(v, u, dt, p, slope_deg=0):
     rho = 1.2
     F_trac = (u / 100.0) * p["Fmax"]
     F_aero = 0.5 * rho * p["Cd"] * p["A"] * v**2
-    a = (F_trac - F_aero) / p["m"]
+    # Slope force: m * g * sin(angle)
+    slope_rad = np.radians(slope_deg)
+    F_slope = p["m"] * G * np.sin(slope_rad)
+    a = (F_trac - F_aero - F_slope) / p["m"]
     return max(0.0, min(p["v_max"], v + a * dt))
 
 
@@ -115,9 +118,9 @@ def fuzzy_controller(buckets, span):
     # ============================
     # Agresywność zależna od liczby zbiorów
     # ============================
-    SPAN_SCALE = {3: 0.45, 5: 0.75, 7: 1.00}[buckets]
-    OUT_GAIN   = {3: 2.30, 5: 1.40, 7: 1.00}[buckets]
-    CE_DAMP    = {3: 0.20, 5: 0.50, 7: 0.75}[buckets]
+    SPAN_SCALE = {3: 0.55, 5: 0.75, 7: 1.00}[buckets]
+    OUT_GAIN   = {3: 2.00, 5: 1.40, 7: 1.00}[buckets]
+    CE_DAMP    = {3: 0.15, 5: 0.50, 7: 0.75}[buckets]
 
     span_e = span * SPAN_SCALE
     ce_span = span_e * 0.8
@@ -137,8 +140,7 @@ def fuzzy_controller(buckets, span):
                 a, b, c = centers[i - 1], s, s
             else:
                 a, b, c = centers[i - 1], centers[i], centers[i + 1]
-            out.append(FuzzySet(function=Triangular_MF(a, b, c), term=term)
-)
+            out.append(FuzzySet(function=Triangular_MF(a, b, c), term=term))
         return out
 
     # ============================
@@ -188,7 +190,7 @@ def fuzzy_controller(buckets, span):
     # ============================
     ie = 0.0
     IE_MAX = span * 8.0
-    KI = 0.35
+    KI = {3: 0.50, 5: 0.35, 7: 0.30}[buckets]
     LEAK = 0.002
 
     # ============================
@@ -231,7 +233,6 @@ app.title = APP_TITLE
 app.layout = dbc.Container(fluid=True, children=[
 
     dcc.Store(id="vehicle", data="osobowe"),
-    dcc.Store(id="fuzzy-buckets", data=5),
 
     dbc.Row([
         dbc.Col(
@@ -245,7 +246,11 @@ app.layout = dbc.Container(fluid=True, children=[
         dbc.Col(width=3, children=[
             dbc.Card(style={"padding": "12px", "marginTop": "20px"}, children=[
 
-                html.B("Wybór pojazdu"),
+                html.Div([
+                    html.B("Wybór pojazdu"),
+                    html.Span(" ⓘ", id="tooltip-vehicle", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Wybierz typ pojazdu do symulacji. Każdy pojazd ma inne parametry fizyczne.", target="tooltip-vehicle"),
                 dbc.ButtonGroup(
                     [
                         dbc.Button("Sportowe", id="veh-sportowe", outline=True, color="primary"),
@@ -254,60 +259,89 @@ app.layout = dbc.Container(fluid=True, children=[
                     ],
                     className="mb-2 w-100"
                 ),
+                dbc.Tooltip("🏎️ Masa: 1500 kg | Moc: ~500 KM | Vmax: 324 km/h | A: 2.2 m²", target="veh-sportowe"),
+                dbc.Tooltip("🚗 Masa: 1600 kg | Moc: ~180 KM | Vmax: 216 km/h | A: 2.4 m²", target="veh-osobowe"),
+                dbc.Tooltip("🚛 Masa: 40000 kg | Moc: ~750 KM | Vmax: 108 km/h | A: 10 m²", target="veh-ciezarowe"),
 
-                html.Label("Prędkość docelowa [m/s]"),
+                html.Div([
+                    html.Label("Prędkość docelowa [m/s]"),
+                    html.Span(" ⓘ", id="tooltip-sp", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Zadana prędkość, którą regulator ma utrzymać.", target="tooltip-sp"),
                 dcc.Slider(id="sp", min=5, max=100, step=1, value=30,
                            marks=None,
                            tooltip={"always_visible": True, "placement": "top"}),
 
-                html.Label("Czas symulacji [s]"),
+                html.Div([
+                    html.Label("Nachylenie powierzchni [°]"),
+                    html.Span(" ⓘ", id="tooltip-slope", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Kąt nachylenia drogi. Wartości dodatnie = pod górę, ujemne = w dół.",
+                            target="tooltip-slope"),
+                dcc.Slider(id="slope", min=-10, max=10, step=0.5, value=0,
+                           marks=None,
+                           tooltip={"always_visible": True, "placement": "top"}),
+
+                html.Div([
+                    html.Label("Czas symulacji [s]"),
+                    html.Span(" ⓘ", id="tooltip-T", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Całkowity czas trwania symulacji.", target="tooltip-T"),
                 dcc.Slider(id="T", min=60, max=600, step=30, value=300,
                            marks=None,
                            tooltip={"always_visible": True, "placement": "top"}),
 
                 html.Hr(),
 
-                html.B("Regulator PID"),
+                html.Div([
+                    html.B("Regulator PID"),
+                    html.Span(" ⓘ", id="tooltip-pid", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Klasyczny regulator PID z członami: proporcjonalnym, całkującym i różniczkującym.", target="tooltip-pid"),
 
-                html.Label("Kp – wzmocnienie regulatora [-]"),
+                html.Div([
+                    html.Label("Kp – wzmocnienie regulatora [-]"),
+                    html.Span(" ⓘ", id="tooltip-kp", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Wzmocnienie proporcjonalne. Większe Kp = szybsza reakcja, ale większe przeregulowanie.", target="tooltip-kp"),
                 dcc.Slider(id="kp", min=0.01, max=0.5, step=0.01,
                            marks=None,
                            tooltip={"always_visible": True, "placement": "top"}),
 
-                html.Label("Ti – czas zdwojenia [s]"),
+                html.Div([
+                    html.Label("Ti – czas zdwojenia [s]"),
+                    html.Span(" ⓘ", id="tooltip-ti", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Czas całkowania. Mniejsze Ti = szybsze eliminowanie uchybu ustalonego.", target="tooltip-ti"),
                 dcc.Slider(id="ti", min=1, max=60, step=1,
                            marks=None,
                            tooltip={"always_visible": True, "placement": "top"}),
 
-                html.Label("Td – czas wyprzedzenia [s]"),
+                html.Div([
+                    html.Label("Td – czas wyprzedzenia [s]"),
+                    html.Span(" ⓘ", id="tooltip-td", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Czas różniczkowania. Większe Td = lepsze tłumienie oscylacji.", target="tooltip-td"),
                 dcc.Slider(id="td", min=0.0, max=10.0, step=0.1,
                            marks=None,
                            tooltip={"always_visible": True, "placement": "top"}),
 
-                html.Label("Tp – okres próbkowania [s]"),
+                html.Div([
+                    html.Label("Tp – okres próbkowania [s]"),
+                    html.Span(" ⓘ", id="tooltip-tp", style={"cursor": "pointer", "color": "#2563eb"}),
+                ]),
+                dbc.Tooltip("Okres próbkowania regulatora. Mniejsze Tp = dokładniejsza regulacja.", target="tooltip-tp"),
                 dcc.Slider(id="tp", min=0.1, max=1.0, step=0.1,
                            marks=None,
                            tooltip={"always_visible": True, "placement": "top"}),
-
-                html.Hr(),
-
-                html.B("Liczba zbiorów rozmytych"),
-                dbc.ButtonGroup(
-                    [
-                        dbc.Button("3", id="fz-3", outline=True, color="primary"),
-                        dbc.Button("5", id="fz-5", outline=True, color="primary"),
-                        dbc.Button("7", id="fz-7", outline=True, color="primary"),
-                    ],
-                    className="w-100"
-                ),
 
             ])
         ]),
 
         dbc.Col(width=9, children=[
+            dcc.Graph(id="graph", style={"height": "600px", "marginTop": "20px"}),
             dbc.Button("Uruchom symulację", id="run",
-                       color="primary", className="w-100 mb-2", style={"marginTop": "20px"}),
-            dcc.Graph(id="graph", style={"height": "600px"})
+                       color="primary", className="w-100 mt-2")
         ])
     ])
 ])
@@ -333,21 +367,6 @@ def select_vehicle(a, b, c):
     return selected, selected == "sportowe", selected == "osobowe", selected == "ciezarowe"
 
 
-@app.callback(
-    Output("fuzzy-buckets", "data"),
-    Output("fz-3", "active"),
-    Output("fz-5", "active"),
-    Output("fz-7", "active"),
-    Input("fz-3", "n_clicks"),
-    Input("fz-5", "n_clicks"),
-    Input("fz-7", "n_clicks"),
-    prevent_initial_call=True,
-)
-def select_fuzzy(a, b, c):
-    ctx = dash.callback_context
-    selected = int(ctx.triggered[0]["prop_id"].split("-")[1].split(".")[0])
-    return selected, selected == 3, selected == 5, selected == 7
-
 
 @app.callback(
     Output("kp", "value"),
@@ -367,16 +386,18 @@ def update_pid(v):
     Output("graph", "figure"),
     Input("run", "n_clicks"),
     State("vehicle", "data"),
-    State("fuzzy-buckets", "data"),
     State("sp", "value"),
     State("T", "value"),
     State("kp", "value"),
     State("ti", "value"),
     State("td", "value"),
     State("tp", "value"),
+    State("slope", "value"),
 )
-def simulate(_, vehicle, buckets, sp, T, kp, ti, td, tp):
+def simulate(_, vehicle, sp, T, kp, ti, td, tp, slope):
     global fuzzy_cache
+
+    buckets = 5  # Fixed to 5 buckets
 
     p = VEHICLES[vehicle]
     pid_defaults = p["pid"]
@@ -390,7 +411,7 @@ def simulate(_, vehicle, buckets, sp, T, kp, ti, td, tp):
     t = np.arange(0, T, cfg["Tp"])
 
     # Check if we need to recalculate fuzzy
-    fuzzy_key = (vehicle, buckets, sp, T, cfg["Tp"])
+    fuzzy_key = (vehicle, buckets, sp, T, cfg["Tp"], slope)
 
     if fuzzy_cache["key"] == fuzzy_key:
         # Reuse cached fuzzy results
@@ -406,7 +427,7 @@ def simulate(_, vehicle, buckets, sp, T, kp, ti, td, tp):
         for _ in t:
             ef = sp - v_fz
             ufz = fz(ef, (ef - ef_prev) / cfg["Tp"], 0)
-            v_fz = step_velocity(v_fz, ufz, cfg["Tp"], p)
+            v_fz = step_velocity(v_fz, ufz, cfg["Tp"], p, slope)
             vf.append(v_fz)
             uf.append(ufz)
             ef_prev = ef
@@ -426,25 +447,42 @@ def simulate(_, vehicle, buckets, sp, T, kp, ti, td, tp):
     for _ in t:
         e = sp - v_pid
         u, I = pid_step(e, e_prev, I, cfg)
-        v_pid = step_velocity(v_pid, u, cfg["Tp"], p)
+        v_pid = step_velocity(v_pid, u, cfg["Tp"], p, slope)
         vp.append(v_pid)
         up.append(u)
         e_prev = e
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
 
-    fig.add_trace(go.Scatter(x=t, y=vp, name="PID"), 1, 1)
-    fig.add_trace(go.Scatter(x=t, y=vf, name="Fuzzy"), 1, 1)
-    fig.add_trace(go.Scatter(x=t, y=[sp]*len(t), name="Zadana", line=dict(dash="dash")), 1, 1)
+    fig.add_trace(go.Scatter(x=t, y=vp, name="PID", legendgroup="velocity", legend="legend"), 1, 1)
+    fig.add_trace(go.Scatter(x=t, y=vf, name="Mamdani", legendgroup="velocity", legend="legend"), 1, 1)
+    fig.add_trace(go.Scatter(x=t, y=[sp]*len(t), name="Zadana", line=dict(dash="dash"), legendgroup="velocity", legend="legend"), 1, 1)
 
-    fig.add_trace(go.Scatter(x=t, y=up, name="Gaz PID"), 2, 1)
-    fig.add_trace(go.Scatter(x=t, y=uf, name="Gaz Fuzzy"), 2, 1)
+    fig.add_trace(go.Scatter(x=t, y=up, name="Gaz - PID", legendgroup="gas", legend="legend2"), 2, 1)
+    fig.add_trace(go.Scatter(x=t, y=uf, name="Gaz - Mamdani", legendgroup="gas", legend="legend2"), 2, 1)
 
-    fig.update_yaxes(title="Prędkość [m/s]", row=1, col=1, range=[0, p["v_max"]+30])
-    fig.update_yaxes(title="Gaz [%]", row=2, col=1, range=[U_MIN, U_MAX])
+    fig.update_yaxes(title="Prędkość [m/s]", row=1, col=1, range=[0, p["v_max"]+10])
+    fig.update_yaxes(title="Gaz [%]", row=2, col=1, range=[U_MIN, U_MAX+10])
     fig.update_xaxes(title="Czas [s]", row=2, col=1)
 
-    fig.update_layout(height=600, autosize=False)
+    fig.update_layout(
+        height=600,
+        autosize=False,
+        legend=dict(
+            yanchor="top",
+            y=0.98,
+            xanchor="left",
+            x=1.02,
+            title="Prędkość"
+        ),
+        legend2=dict(
+            yanchor="top",
+            y=0.45,
+            xanchor="left",
+            x=1.02,
+            title="Gaz"
+        )
+    )
 
     return fig
 
