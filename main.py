@@ -24,7 +24,9 @@ fuzzy_cache = {
     "key": None,  # (vehicle, buckets, sp, T, Tp)
     "t": None,
     "vf": None,
-    "uf": None,
+    "Ftrac_f": None,
+    "Faero_f": None,
+    "Fslope_f": None,
 }
 
 
@@ -35,6 +37,7 @@ VEHICLES = {
         "Cd": 0.30,
         "A": 2.2,
         "Fmax": 16000.0,
+        "Pmax": 350000.0,  # 350 kW (~476 KM)
         "v_max": 90.0,
         "pid": dict(Kp=0.32, Ti=7.0, Td=0.9, Tp=0.1),
         "fuzzy_span": 60.0,
@@ -45,6 +48,7 @@ VEHICLES = {
         "Cd": 0.32,
         "A": 2.4,
         "Fmax": 7000.0,
+        "Pmax": 130000.0,  # 130 kW (~177 KM)
         "v_max": 60.0,
         "pid": dict(Kp=0.24, Ti=10.0, Td=1.0, Tp=0.2),
         "fuzzy_span": 45.0,
@@ -55,6 +59,7 @@ VEHICLES = {
         "Cd": 0.7,
         "A": 10.0,
         "Fmax": 27000.0,
+        "Pmax": 400000.0,  # 400 kW (~544 KM)
         "v_max": 30.0,
         "pid": dict(Kp=0.40, Ti=12.0, Td=1.5, Tp=0.2),
         "fuzzy_span": 25.0,
@@ -70,15 +75,28 @@ def clamp(u):
     return max(U_MIN, min(U_MAX, u))
 
 
-def step_velocity(v, u, dt, p, slope_deg=0):
+def step_velocity(v, u, dt, p, slope_deg=0, return_forces=False):
     rho = 1.2
-    F_trac = (u / 100.0) * p["Fmax"]
+    v_eps = 1.0  # minimalna prędkość do obliczeń mocy (unikamy dzielenia przez 0)
+
+    # Siła z pedału gazu
+    F_pedal = (u / 100.0) * p["Fmax"]
+
+    # Limit mocy: F_limit = Pmax / max(v, v_eps)
+    F_limit = p["Pmax"] / max(v, v_eps)
+
+    # Rzeczywista siła ciągu = min(siła z pedału, limit mocy)
+    F_trac = min(F_pedal, F_limit) if u > 0 else max(F_pedal, -F_limit)
+
     F_aero = 0.5 * rho * p["Cd"] * p["A"] * v**2
     # Slope force: m * g * sin(angle)
     slope_rad = np.radians(slope_deg)
     F_slope = p["m"] * G * np.sin(slope_rad)
     a = (F_trac - F_aero - F_slope) / p["m"]
-    return max(0.0, min(p["v_max"], v + a * dt))
+    v_new = max(0.0, min(p["v_max"], v + a * dt))
+    if return_forces:
+        return v_new, F_trac, F_aero, F_slope
+    return v_new
 
 
 # ======================================================
@@ -427,13 +445,15 @@ def simulate(_, vehicle, sp, T, kp, ti, td, tp, slope):
     if fuzzy_cache["key"] == fuzzy_key:
         # Reuse cached fuzzy results
         vf = fuzzy_cache["vf"]
-        uf = fuzzy_cache["uf"]
+        Ftrac_f = fuzzy_cache["Ftrac_f"]
+        Faero_f = fuzzy_cache["Faero_f"]
+        Fslope_f = fuzzy_cache["Fslope_f"]
     else:
         # Calculate fuzzy simulation
         fz = fuzzy_controller(buckets, p["fuzzy_span"])
         v_fz = 0.0
         ef_prev = 0.0
-        vf, uf = [], []
+        vf, Ftrac_f, Faero_f, Fslope_f = [], [], [], []
 
         u_hold = 0.0  # ostatnie sterowanie fuzzy (ZOH)
 
@@ -444,23 +464,27 @@ def simulate(_, vehicle, sp, T, kp, ti, td, tp, slope):
                 u_hold = fz(ef, (ef - ef_prev) / cfg["Tp"], 0)
                 ef_prev = ef
 
-            v_fz = step_velocity(v_fz, u_hold, cfg["Tp"], p, slope)
+            v_fz, ft, fa, fs = step_velocity(v_fz, u_hold, cfg["Tp"], p, slope, return_forces=True)
 
             vf.append(v_fz)
-            uf.append(u_hold)
+            Ftrac_f.append(ft)
+            Faero_f.append(fa)
+            Fslope_f.append(fs)
             ef_prev = ef
 
         # Cache the results
         fuzzy_cache["key"] = fuzzy_key
         fuzzy_cache["t"] = t
         fuzzy_cache["vf"] = vf
-        fuzzy_cache["uf"] = uf
+        fuzzy_cache["Ftrac_f"] = Ftrac_f
+        fuzzy_cache["Faero_f"] = Faero_f
+        fuzzy_cache["Fslope_f"] = Fslope_f
 
     # Always calculate PID simulation (fast)
     v_pid = 0.0
     I = 0.0
     e_prev = 0.0
-    vp, up = [], []
+    vp, Ftrac_p, Faero_p, Fslope_p = [], [], [], []
 
     F_slope_ff = p["m"] * G * np.sin(np.radians(slope))
     u_ff = (F_slope_ff / p["Fmax"]) * 100.0
@@ -469,23 +493,26 @@ def simulate(_, vehicle, sp, T, kp, ti, td, tp, slope):
         e = sp - v_pid
         u_pid, I, D_prev = pid_step(e, e_prev, I, cfg, D_prev)
         u = clamp(u_ff + u_pid)
-        v_pid = step_velocity(v_pid, u, cfg["Tp"], p, slope)
+        v_pid, ft, fa, fs = step_velocity(v_pid, u, cfg["Tp"], p, slope, return_forces=True)
 
         vp.append(v_pid)
-        up.append(u)
+        Ftrac_p.append(ft)
+        Faero_p.append(fa)
+        Fslope_p.append(fs)
         e_prev = e
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
 
-    fig.add_trace(go.Scatter(x=t, y=vp, name="PID", legendgroup="velocity", legend="legend"), 1, 1)
-    fig.add_trace(go.Scatter(x=t, y=vf, name="Mamdani", legendgroup="velocity", legend="legend"), 1, 1)
+    fig.add_trace(go.Scatter(x=t, y=np.round(vp, 2), name="PID", legendgroup="velocity", legend="legend"), 1, 1)
+    fig.add_trace(go.Scatter(x=t, y=np.round(vf, 2), name="Mamdani", legendgroup="velocity", legend="legend"), 1, 1)
     fig.add_trace(go.Scatter(x=t, y=[sp]*len(t), name="Zadana", line=dict(dash="dash"), legendgroup="velocity", legend="legend"), 1, 1)
 
-    fig.add_trace(go.Scatter(x=t, y=up, name="Gaz - PID", legendgroup="gas", legend="legend2"), 2, 1)
-    fig.add_trace(go.Scatter(x=t, y=uf, name="Gaz - Mamdani", legendgroup="gas", legend="legend2"), 2, 1)
+    fig.add_trace(go.Scatter(x=t, y=np.round(Ftrac_p, 0), name="Siła napędowa – PID (symulacja)", legendgroup="forces", legend="legend2"), 2, 1)
+    fig.add_trace(go.Scatter(x=t, y=np.round(Ftrac_f, 0), name="Siła napędowa – Mamdani (symulacja)", legendgroup="forces", legend="legend2"), 2, 1)
+
 
     fig.update_yaxes(title="Prędkość [m/s]", row=1, col=1, range=[0, p["v_max"]+10])
-    fig.update_yaxes(title="Gaz [%]", row=2, col=1, range=[U_MIN, U_MAX+10])
+    fig.update_yaxes(title="Siła [N]", row=2, col=1)
     fig.update_xaxes(title="Czas [s]", row=2, col=1)
 
     fig.update_layout(
@@ -503,7 +530,7 @@ def simulate(_, vehicle, sp, T, kp, ti, td, tp, slope):
             y=0.45,
             xanchor="left",
             x=1.02,
-            title="Gaz"
+            title="Siły"
         )
     )
 
